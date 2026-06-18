@@ -1,0 +1,2164 @@
+
+#include <iostream>
+#include <iomanip>
+
+// Data Structures:
+#include <vector>
+#include <string>
+#include <map>
+
+// C Libraries:
+#include <ctime>
+#include <cstdlib>
+#include <chrono>
+
+// OS Libraries:
+#include <thread>
+#include <sstream>
+#include <mutex>
+#include <queue>
+#include <algorithm>
+#include <termios.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <regex>
+#include <limits>
+
+// OTHERS:
+#include <cmath>
+
+// GRAPHICS:
+#include <SFML/Graphics.hpp>
+
+using namespace std;
+
+// Global Constants
+const int SIMULATION_DURATION = 300;       
+const int TIME_STEP = 1;                   
+const string ADMIN_USERNAME = "admin";
+const string ADMIN_PASSWORD = "atcs2025";
+const int AGING_THRESHOLD = 30;            
+const int AVG_RUNWAY_USAGE_TIME = 5;       
+const double COMMERCIAL_FINE = 500000.0;   
+const double CARGO_FINE = 700000.0;        
+const double SERVICE_FEE = 0.15;           
+const int DUE_DAYS = 3;                    
+
+enum AircraftType { COMMERCIAL, CARGO, EMERGENCY };
+enum FlightPhase {
+    HOLDING, APPROACH, LANDING, TAXI, AT_GATE,     
+    TAKEOFF_ROLL, CLIMB, DEPARTURE_CRUISE,         
+    AT_GATE_BRS, DEPARTURE_CRUISE_BRS,
+    ACCELERATING_TO_CRUISE,
+};
+enum Direction { NORTH, SOUTH, EAST, WEST };
+enum RunwayID { RWY_A, RWY_B, RWY_C };
+enum Priority { EMERGENCY_PRIORITY, HIGH_PRIORITY, NORMAL_PRIORITY };
+
+struct AVN 
+{
+    string avnID;              
+    string flightNumber;
+    string airlineName;
+    AircraftType aircraftType;
+    double speedRecorded;       
+    string speedPermissible;    
+    double altitudeRecorded;    
+    string altitudePermissible; 
+    time_t issueTime;
+    int fineAmount;
+    string paymentStatus;      
+    time_t dueDate;
+};
+
+struct Airline 
+{
+    string name;
+    AircraftType type;
+    int aircraftCount;
+    int flightCount;
+    int violations;
+};
+
+struct Aircraft
+{
+    string flightNumber;
+    Airline* airline;
+    AircraftType type;
+    Direction direction;
+    bool isEmergency;
+    bool hasAVN;
+    
+    FlightPhase phase;
+    double speed; 
+    bool isFaulty;
+    int timeInFlight = 0;
+    int fuelStatus; 
+    
+    Priority priority;
+    time_t scheduledTime;
+    int actualWaitTime = 0;
+    int estimatedWaitTime = 0;
+    
+    string status = "Waiting";
+    double altitude = 0;
+};
+
+struct Runway 
+{
+    RunwayID id;
+    string name;
+    bool isOccupied;
+    Aircraft* currentAircraft;
+    queue<Aircraft*> waitingQueue;  
+};
+
+struct ComparePriority 
+{
+    bool operator()(Aircraft* aircraft1, Aircraft* aircraft2) 
+    {
+        if (aircraft1->priority == aircraft2->priority) 
+            return aircraft1->scheduledTime > aircraft2->scheduledTime;     
+        return aircraft1->priority > aircraft2->priority;
+    }
+};
+
+// Global variables
+mutex coutMutex;
+mutex simulationMutex;
+mutex avnListMutex;
+
+priority_queue<Aircraft*, vector<Aircraft*>, ComparePriority> arrivalQueue;
+priority_queue<Aircraft*, vector<Aircraft*>, ComparePriority> departureQueue;
+map<string, Aircraft*> aircraftStatusMap;
+
+bool cargoCreated = false;
+bool simulationRunning = false;
+bool simulationPaused = true; 
+
+thread simulationThread;
+int globalElapsedTime = 0; 
+vector<AVN> avnList;       
+static int avnSequence = 0; 
+
+void clearInputBuffer() { cin.clear(); cin.ignore(numeric_limits<streamsize>::max(), '\n');}
+
+bool isValidInteger(const string& str, int& value, int min, int max) 
+{
+    if (str.empty()) return false;
+
+    int i = 0;
+    bool isNegative = (str[0] == '-');
+    if (isNegative) i = 1;
+
+    for (; i < str.length(); i++)
+        if (!isdigit(str[i]))
+            return false;
+        
+    value = atoi(str.c_str());
+    if (isNegative) value = -value;
+
+    if (value >= min && value <= max)
+        return true;
+    return false;
+}
+
+bool isValidTimeFormat(const string& timeStr, struct tm& tm) 
+{
+    regex timeRegex("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}");
+    if (!regex_match(timeStr, timeRegex))
+        return false;
+    
+    istringstream ss(timeStr);
+    ss >> get_time(&tm, "%Y-%m-%d %H:%M");
+    if (ss.fail())
+        return false;
+    
+    if (tm.tm_year < 125)  
+        return false;
+    
+    if (tm.tm_mon < 0 || tm.tm_mon > 11) 
+        return false;
+    
+    if (tm.tm_hour < 0 || tm.tm_hour > 23) 
+        return false;
+    
+    if (tm.tm_min < 0 || tm.tm_min > 59) 
+        return false;
+        
+    int daysInMonth[] = {31, (tm.tm_year % 4 == 0 && tm.tm_year % 100 != 0) || (tm.tm_year % 400 == 0) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (tm.tm_mday < 1 || tm.tm_mday > daysInMonth[tm.tm_mon]) 
+        return false;    
+
+    return true;
+}
+
+// Prototypes
+void displayWelcomeScreen();
+bool login();
+void displayMenu();
+void spawnCustomAircraft(vector<Airline>& airlines, vector<Aircraft*>& activeAircrafts, int& aircraftSequence);
+void spawnRandomAircraft(vector<Airline>& airlines, vector<Aircraft*>& activeAircrafts, int& aircraftSequence);
+void startSimulation(vector<Airline>& airlines, vector<Runway>& runways, vector<Aircraft*>& activeAircrafts, int& aircraftSequence);
+void runSimulation(vector<Airline>& airlines, vector<Runway>& runways, vector<Aircraft*>& activeAircrafts, int& aircraftSequence);
+void showSimulation(vector<Airline>& airlines, vector<Runway>& runways, vector<Aircraft*>& activeAircrafts, int& aircraftSequence);
+void accessAirlinePortal();
+bool airlineLogin(string& airlineName);
+void displayAirlineMenu();
+void viewAllAVNs(const string& airlineName);
+void viewSpecificAVN(const string& airlineName);
+void initiatePayment(const string& airlineName);
+void mockStripePay(const AVN& avn);
+void removeAircraftFromEverywhere(Aircraft* aircraft, vector<Aircraft*>& aircrafts, vector<Runway>& runways);
+void initializeAirlines(vector<Airline>& airlines);
+void initializeRunways(vector<Runway>& runways);
+string generateFlightNumber(const Airline& airline, int sequence);
+Aircraft* createAircraftForManualEntry(vector<Airline>& airlines, Direction direction, int seq, string flightNum, AircraftType type, Priority priority, time_t schedTime);
+Aircraft* createAircraftForAutoEntry(const vector<Airline>& airlines, Direction direction, int seq);
+void simulateArrival(Aircraft& aircraft, vector<Runway>& runways);
+void simulateDeparture(Aircraft& aircraft, vector<Runway>& runways);
+void updateAircraftSpeed(Aircraft& aircraft);
+void updateAircraftAltitude(Aircraft& aircraft);
+double calculateAltitudeChange(const Aircraft& aircraft);
+void checkForViolations(Aircraft& aircraft);
+void generateAVN(Aircraft& aircraft, bool speedViolation, bool altitudeViolation);
+void updateAVNPaymentStatus(const string& avnID);
+void displayStatus(const vector<Aircraft*>& aircrafts, const vector<Runway>& runways, int elapsedTime);
+void handleGroundFaults(vector<Aircraft*>& aircrafts);
+Runway* assignRunway(Aircraft& aircraft, vector<Runway>& runways);
+string getPhaseName(FlightPhase phase);
+string getDirectionName(Direction dir);
+string getAircraftTypeName(AircraftType type);
+void updateWaitTimes(vector<Runway>& runways);
+void updateAircraftStatus(Aircraft& aircraft);
+bool kbhit();
+void updateSimulationStep(vector<Airline>& airlines, vector<Runway>& runways, vector<Aircraft*>& activeAircrafts);
+void rebuildQueue(Aircraft* aircraft, priority_queue<Aircraft*, vector<Aircraft*>, ComparePriority>& queue);
+bool isAircraftWaiting(const Aircraft& aircraft, const vector<Runway>& runways);
+int calculateEstimatedWaitTime(Aircraft& aircraft, const vector<Runway>& runways);
+void displayAVNStatistics(const vector<Airline>& airlines);
+
+void setNonBlockingInput(bool enable) 
+{
+    struct termios ttystate;
+    tcgetattr(STDIN_FILENO, &ttystate);
+    if (enable) 
+    {
+        ttystate.c_lflag &= ~(ICANON | ECHO);
+        ttystate.c_cc[VMIN] = 0;
+        ttystate.c_cc[VTIME] = 0;
+    } 
+    else 
+        ttystate.c_lflag |= (ICANON | ECHO);
+    
+    tcsetattr(STDIN_FILENO, TCSANOW, &ttystate);
+
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (enable) 
+        fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+    else 
+        fcntl(STDIN_FILENO, F_SETFL, flags & ~O_NONBLOCK);
+}
+
+void cleanupSimulation(vector<Aircraft*>& activeAircrafts, vector<Runway>& runways) 
+{
+    lock_guard<mutex> guard(simulationMutex);
+    simulationRunning = false;
+    simulationPaused = true;
+    globalElapsedTime = 0;
+
+    if (simulationThread.joinable()) 
+        simulationThread.join();
+
+    vector<Aircraft*> aircraftToDelete = activeAircrafts;
+
+    for (auto& runway : runways) 
+    {
+        runway.isOccupied = false;
+        runway.currentAircraft = nullptr;
+        while (!runway.waitingQueue.empty()) 
+            runway.waitingQueue.pop();        
+    }
+
+    while (!arrivalQueue.empty()) 
+        arrivalQueue.pop();    
+
+    while (!departureQueue.empty())
+        departureQueue.pop();
+    
+    activeAircrafts.clear();
+    aircraftStatusMap.clear();
+
+    for (auto aircraft : aircraftToDelete) 
+        delete aircraft;
+
+    avnSequence = 0;
+    cargoCreated = false;
+}
+
+int main() 
+{
+    srand(time(0));
+    vector<Airline> airlines;
+    vector<Runway> runways;
+    vector<Aircraft*> activeAircrafts;
+    int aircraftSequence = 0;
+
+    displayWelcomeScreen();
+
+    if (!login()) 
+    {
+        cout << "Too many failed attempts. Exiting..." << endl;
+        return 1;
+    }
+
+    while (true) 
+    {
+        setNonBlockingInput(false);
+        displayMenu();
+        int choice;
+        string input;
+    
+        while (true) 
+        {
+            cout << "Enter your choice: ";
+            getline(cin, input);
+            if (isValidInteger(input, choice, 1, 7))
+                break;            
+            cout << "Invalid input. Please enter a number between 1 and 7. Press Enter to continue...\n";
+            clearInputBuffer();
+        }
+
+        switch (choice) 
+        {
+            case 1: 
+                if (!simulationRunning) 
+                {
+                    initializeAirlines(airlines);
+                    initializeRunways(runways);
+                    simulationRunning = true;
+                    simulationPaused = true; 
+                    simulationThread = thread(runSimulation, ref(airlines), ref(runways), ref(activeAircrafts), ref(aircraftSequence));
+                    simulationThread.detach();
+                    cout << "Simulation started (paused until shown).\n";
+                }
+                else 
+                    cout << "Simulation is already running!\n";                
+                break;
+
+            case 2: 
+                if (simulationRunning) 
+                {
+                    displayAVNStatistics(airlines);
+                    cleanupSimulation(activeAircrafts, runways);
+                    airlines.clear();
+                    runways.clear();
+                    cout << "Simulation terminated.\n";
+                } 
+                else 
+                    cout << "No simulation is running!\n";
+                break;
+
+            case 3: 
+                if (simulationRunning) 
+                { 
+                    lock_guard<mutex> guard(simulationMutex);
+                    simulationPaused = true;
+                    spawnCustomAircraft(airlines, activeAircrafts, aircraftSequence);
+                }
+                else 
+                    cout << "Please start the simulation first!\n";
+                break;
+
+            case 4: 
+                if (simulationRunning) 
+                {
+                    lock_guard<mutex> guard(simulationMutex);
+                    simulationPaused = true;
+                    spawnRandomAircraft(airlines, activeAircrafts, aircraftSequence);
+                } 
+                else                 
+                    cout << "Dear, start the simulation first!\n";  
+                break;
+
+            case 5: 
+                if (simulationRunning) 
+                    showSimulation(airlines, runways, activeAircrafts, aircraftSequence);
+                else 
+                    cout << "No simulation is running!\n";
+                break;
+
+            case 6: 
+                if (simulationRunning) 
+                {
+                    displayAVNStatistics(airlines);
+                    cleanupSimulation(activeAircrafts, runways);
+                    avnList.clear();
+                }
+                cout << "Exiting AirControlX. Goodbye!\n";
+                return 0;
+
+			case 7:
+        	{
+	            lock_guard<mutex> guard(simulationMutex);
+	            simulationPaused = true;
+	            accessAirlinePortal();
+       		}
+        	break;
+            default:
+                cout << "Invalid choice. It's not that hard!\n";
+        }
+    }
+    return 0;
+}
+
+void displayWelcomeScreen() 
+{
+    cout << "\033[1;36m"; 
+    cout << R"(
+    ╔══════════════════════════════════════════════════════╗
+    ║                                                      ║
+    ║       █████╗ ██╗  ██╗ ███████╗     █████╗ ████████╗ ██████╗ ███████╗    
+    ║      ██╔══██╗██║ ██╔╝ ██╔════╝    ██╔══██╗╚══██╔══╝██╔════╝ ██╔════╝     
+    ║      ███████║█████╔╝  █████╗      ███████║   ██║   ██║      ███████╗    
+    ║      ██╔══██║██╔═██╗  ██╔══╝      ██╔══██║   ██║   ██║       ╚════██║     
+    ║      ██║  ██║██║  ██╗ ██║         ██║  ██║   ██║   ╚██████╔  ███████║    
+    ║      ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═╝         ╚═╝  ╚═╝   ╚═╝    ╚═════╝  ╚══════╝    
+    ║                                                      ║
+    ║           Automated Air Traffic Control System       ║
+    ║           Developed by: Muhammad Bilal Abbasi    ║
+    ║                                                      ║
+    ╚══════════════════════════════════════════════════════╝
+    )" << endl;
+    cout << "\033[0m"; 
+    cout << "Press Enter to continue...";
+    cin.get();
+}
+
+bool login() 
+{
+    int attempts = 3;
+    string username, password;
+
+    while (attempts > 0) 
+    {
+        lock_guard<mutex> guard(coutMutex);
+        cout << "\n=== AirControlX Login ===\n";
+        while (true)
+        {
+            cout << "Username: ";
+            getline(cin, username);
+            if (!username.empty() && username.length() <= 50) 
+                break;
+            cout << "Invalid username. Press Enter to continue...\n";
+            clearInputBuffer();
+        }
+
+        while (true)
+        {
+            cout << "Password: ";
+            getline(cin, password);
+            if (!password.empty() && password.length() <= 50) 
+                break;
+            cout << "Invalid password. Press Enter to continue...\n";
+            clearInputBuffer();
+        }
+
+        if (username == ADMIN_USERNAME && password == ADMIN_PASSWORD) 
+        {
+            cout << "Login successful!\n" << endl;
+            return true;
+        } 
+        else 
+        {
+            attempts--;
+            cout << "Invalid credentials. " << attempts << " attempts remaining.\n" << endl;
+        }
+    }
+    return false;
+}
+
+void displayMenu() 
+{
+    lock_guard<mutex> guard(coutMutex);
+    cout << "\n=== AirControlX Main Menu ===\n";
+    cout << "1. Start Simulation\n";
+    cout << "2. End Simulation\n";
+    cout << "3. Spawn Custom Aircraft\n";
+    cout << "4. Spawn Random Aircraft\n";
+    cout << "5. Show Simulation\n";
+    cout << "6. Exit\n";
+    cout << "7. Access Airline Portal\n";
+}
+
+void accessAirlinePortal() 
+{
+    string airlineName;
+    if (airlineLogin(airlineName)) 
+    {
+        while (true) 
+        {
+            displayAirlineMenu();
+            int choice;
+            string input;
+            while (true) 
+            {
+                cout << "Enter your choice: ";
+                getline(cin, input);
+                if (isValidInteger(input, choice, 1, 4)) {
+                    break;
+                }
+                cout << "Invalid input. Please enter a number between 1 and 4. Press Enter to continue...\n";
+                clearInputBuffer();
+            }
+
+            switch (choice) 
+            {
+                case 1: 
+                    viewAllAVNs(airlineName);
+                    break;
+                case 2: 
+                    viewSpecificAVN(airlineName);
+                    break;
+                case 3: 
+                    initiatePayment(airlineName);
+                    break;
+                case 4: 
+                    {
+                        lock_guard<mutex> guard(coutMutex);
+                        cout << "Logged out from Airline Portal.\n";
+                    }
+                    return;
+                default:
+                    {
+                        lock_guard<mutex> guard(coutMutex);
+                        cout << "Invalid choice. Please try again.\n";
+                    }
+            }
+        }
+    }
+}
+
+bool airlineLogin(string& airlineName) 
+{
+    lock_guard<mutex> guard(coutMutex);
+    cout << "\n=== Airline Portal Login ===\n";
+
+    int attempts = 3;
+    string flightNumber, avnID;
+
+    while (attempts > 0) 
+    {
+        while (true) 
+        {
+            cout << "Enter Flight Number (e.g., PK101): ";
+            getline(cin, flightNumber);
+            if (!flightNumber.empty() && flightNumber.length() <= 10) 
+                break;
+            cout << "Invalid flight number. Press Enter to continue...\n";
+            clearInputBuffer();
+        }
+
+        while (true) 
+        {
+            cout << "Enter AVN ID (e.g., AVN-20250507-001): ";
+            getline(cin, avnID);
+            regex avnRegex("AVN-\\d{8}-\\d{3}");
+            if (regex_match(avnID, avnRegex)) 
+                break;
+            cout << "Invalid AVN ID format. Use AVN-YYYYMMDD-NNN. Press Enter to continue...\n";
+            clearInputBuffer();
+        }
+
+        lock_guard<mutex> avnGuard(avnListMutex);
+        for (const auto& avn : avnList) 
+        {
+            if (avn.flightNumber == flightNumber && avn.avnID == avnID) 
+            {
+                airlineName = avn.airlineName;
+                cout << "Login successful for " << airlineName << "!\n";
+                return true;
+            }
+        }
+
+        attempts--;
+        cout << "Invalid credentials. " << attempts << " attempts remaining.\n";
+    }
+
+    cout << "Too many failed attempts. Returning to main menu...\n";
+    return false;
+}
+
+void displayAirlineMenu() 
+{
+    lock_guard<mutex> guard(coutMutex);
+    cout << "\n=== Airline Portal Menu ===\n";
+    cout << "1. View All AVNs\n";
+    cout << "2. View Specific AVN\n";
+    cout << "3. Initiate Payment\n";
+    cout << "4. Logout\n";
+}
+
+void viewAllAVNs(const string& airlineName) 
+{
+    cout << "\n=== AVNs for " << airlineName << " ===\n";
+
+    const int idWidth = 15;
+    const int flightWidth = 12;
+    const int typeWidth = 12;
+    const int speedWidth = 15;
+    const int altWidth = 15;
+    const int fineWidth = 15;
+    const int statusWidth = 10;
+    const int timeWidth = 20;
+
+    cout << "| " << left << setw(idWidth) << "AVN ID"
+        << "| " << left << setw(flightWidth) << "Flight No"
+        << "| " << left << setw(typeWidth) << "Type"
+        << "| " << right << setw(speedWidth) << "Speed (km/h)"
+        << "| " << right << setw(altWidth) << "Altitude (ft)"
+        << "| " << right << setw(fineWidth) << "Fine (PKR)"
+        << "| " << left << setw(statusWidth) << "Status"
+        << "| " << left << setw(timeWidth) << "Issue Time"
+        << "| " << left << setw(timeWidth) << "Due Time" << " |\n";
+    cout << "+-" << string(idWidth, '-') << "-+-"
+        << string(flightWidth, '-') << "-+-"
+        << string(typeWidth, '-') << "-+-"
+        << string(speedWidth, '-') << "-+-"
+        << string(altWidth, '-') << "-+-"
+        << string(fineWidth, '-') << "-+-"
+        << string(statusWidth, '-') << "-+-"
+        << string(timeWidth, '-') << "-+-"
+        << string(timeWidth, '-') << "-+\n";
+
+    bool hasAVNs = false;
+    time_t now = time(nullptr);
+    for (const auto& avn : avnList) 
+    {
+        if (avn.airlineName == airlineName) 
+        {
+            hasAVNs = true;
+            string status = avn.paymentStatus;
+            if (status == "unpaid" && difftime(now, avn.dueDate) > 0) 
+                status = "overdue";
+
+            char issueTimeStr[20];
+            strftime(issueTimeStr, sizeof(issueTimeStr), "%Y-%m-%d %H:%M", localtime(&avn.issueTime));
+            char dueTimeStr[20];
+            strftime(dueTimeStr, sizeof(dueTimeStr), "%Y-%m-%d %H:%M", localtime(&avn.dueDate));
+            cout << "| " << left << setw(idWidth) << avn.avnID
+                << "| " << left << setw(flightWidth) << avn.flightNumber
+                << "| " << left << setw(typeWidth) << getAircraftTypeName(avn.aircraftType)
+                << "| " << right << setw(speedWidth) << fixed << setprecision(2) << avn.speedRecorded << " (" << avn.speedPermissible << ")"
+                << "| " << right << setw(altWidth) << fixed << setprecision(2) << avn.altitudeRecorded << " (" << avn.altitudePermissible << ")"
+                << "| " << right << setw(fineWidth) << fixed << setprecision(2) << avn.fineAmount
+                << "| " << left << setw(statusWidth) << status
+                << "| " << left << setw(timeWidth) << issueTimeStr
+                << "| " << left << setw(timeWidth) << dueTimeStr << " |\n";
+        }
+    }
+
+    cout << "+-" << string(idWidth, '-') << "-+-"
+        << string(flightWidth, '-') << "-+-"
+        << string(typeWidth, '-') << "-+-"
+        << string(speedWidth, '-') << "-+-"
+        << string(altWidth, '-') << "-+-"
+        << string(fineWidth, '-') << "-+-"
+        << string(statusWidth, '-') << "-+-"
+        << string(timeWidth, '-') << "-+-"
+        << string(timeWidth, '-') << "-+\n";
+
+    if (!hasAVNs) 
+        cout << "No AVNs found for " << airlineName << ".\n";
+
+    cout << "Press Enter to continue...";
+    clearInputBuffer();
+    cin.get();
+}
+
+void viewSpecificAVN(const string& airlineName) 
+{
+    string avnID;
+    cout << "\n=== View Specific AVN ===\n";
+    
+    while (true) 
+    {
+        cout << "Enter AVN ID (e.g., AVN-20250507-001): ";
+        getline(cin, avnID);
+        regex avnRegex("AVN-\\d{8}-\\d{3}");
+
+        if (regex_match(avnID, avnRegex))
+            break;
+        
+        cout << "Invalid AVN ID format. Use AVN-YYYYMMDD-NNN. Press Enter to continue...\n";
+        clearInputBuffer();
+    }
+
+    bool found = false;
+    time_t now = time(nullptr);
+    for (const auto& avn : avnList) 
+    {
+        if (avn.airlineName == airlineName && avn.avnID == avnID) 
+        {
+            found = true;
+            string status = avn.paymentStatus;
+            if (status == "unpaid" && difftime(now, avn.dueDate) > 0) 
+                status = "overdue";
+            
+            char issueTimeStr[20];
+            strftime(issueTimeStr, sizeof(issueTimeStr), "%Y-%m-%d %H:%M", localtime(&avn.issueTime));
+            char dueTimeStr[20];
+            strftime(dueTimeStr, sizeof(dueTimeStr), "%Y-%m-%d %H:%M", localtime(&avn.dueDate));
+            cout << "\nAVN Details:\n";
+            cout << "AVN ID: " << avn.avnID << "\n";
+            cout << "Flight Number: " << avn.flightNumber << "\n";
+            cout << "Airline: " << avn.airlineName << "\n";
+            cout << "Aircraft Type: " << getAircraftTypeName(avn.aircraftType) << "\n";
+            cout << "Speed Recorded: " << fixed << setprecision(2) << avn.speedRecorded << " km/h (" << avn.speedPermissible << ")\n";
+            cout << "Altitude Recorded: " << fixed << setprecision(2) << avn.altitudeRecorded << " ft (" << avn.altitudePermissible << ")\n";
+            cout << "Fine Amount: PKR " << fixed << setprecision(2) << avn.fineAmount << "\n";
+            cout << "Payment Status: " << status << "\n";
+            cout << "Issue Time: " << issueTimeStr << "\n";
+            cout << "Due Time: " << dueTimeStr << "\n";
+            break;
+        }
+    }
+
+    if (!found) 
+        cout << "AVN ID " << avnID << " not found for " << airlineName << "." << endl;
+    
+    cout << "Press Enter to continue...";
+    clearInputBuffer();
+    cin.get();
+}
+
+void initiatePayment(const string& airlineName) 
+{
+    string avnID;
+    cout << "\n=== Initiate Payment ===\n";
+    while (true) 
+    {
+        cout << "Enter AVN ID for payment (e.g., AVN-20250507-001): ";
+        getline(cin, avnID);
+        regex avnRegex("AVN-\\d{8}-\\d{3}");
+        
+        if (regex_match(avnID, avnRegex)) 
+            break;
+        
+        cout << "Invalid AVN ID format. Use AVN-YYYYMMDD-NNN. Press Enter to continue...\n";
+        clearInputBuffer();
+    }
+
+    for (const auto& avn : avnList) 
+    {
+        if (avn.airlineName == airlineName && avn.avnID == avnID) 
+        {
+            if (avn.paymentStatus == "paid") 
+                cout << "AVN " << avnID << " is already paid.\n";
+            else 
+            {
+                mockStripePay(avn);
+                return;
+            }
+        }
+    }
+    cout << "AVN ID " << avnID << " not found or not associated with " << airlineName << ".\n";
+    cout << "Press Enter to continue...";
+    clearInputBuffer();
+    cin.get();
+}
+
+void mockStripePay(const AVN& avn)
+{
+    cout << "\n=== StripePay Payment Process ===\n";
+    cout << "AVN ID: " << avn.avnID << "\n";
+    cout << "Flight Number: " << avn.flightNumber << "\n";
+    cout << "Airline: " << avn.airlineName << "\n";
+    cout << "Fine Amount: PKR " << fixed << setprecision(2) << avn.fineAmount << "\n";
+
+    string cardNumber, expiry, cvv, amountStr;
+    int amount;
+
+    while (true) 
+    {
+        cout << "Enter Card Number (16 digits): ";
+        getline(cin, cardNumber);
+        regex cardRegex("\\d{16}");
+        if (regex_match(cardNumber, cardRegex)) 
+            break;
+        cout << "Invalid card number. Must be 16 digits. Press Enter to continue...\n";
+        clearInputBuffer();
+    }
+
+    while (true) 
+    {
+        cout << "Enter Expiry (MM/YY): ";
+        getline(cin, expiry);
+        regex expiryRegex("\\d{2}/\\d{2}");
+        if (regex_match(expiry, expiryRegex))
+            break;
+        cout << "Invalid expiry format. Use MM/YY. Press Enter to continue...\n";
+        clearInputBuffer();
+    }
+
+    while (true) 
+    {
+        cout << "Enter CVV (3 digits): ";
+        getline(cin, cvv);
+        regex cvvRegex("\\d{3}");
+        if (regex_match(cvv, cvvRegex)) 
+            break;
+        cout << "Invalid CVV. Must be 3 digits. Press Enter to continue...\n";
+        clearInputBuffer();
+    }
+
+    while (true) 
+    {
+        cout << "Enter Amount to Pay (PKR): ";
+        getline(cin, amountStr);
+        try 
+        {
+            amount = stoi(amountStr);
+            if (amount == avn.fineAmount) 
+                break;
+            cout << "Amount must match fine: PKR " << avn.fineAmount << "\nPress Enter to continue...\n";
+        }
+        catch (...) 
+        {
+            cout << "Invalid amount. Enter a valid number. Press Enter to continue...\n";
+        }
+        clearInputBuffer();
+    }
+
+    cout << "Processing payment...\n";
+    this_thread::sleep_for(chrono::seconds(2));
+    string confirmationID = "STRIPE-" + to_string(rand() % 1000000);
+    cout << "Payment successful! Confirmation ID: " << confirmationID << "\n";
+
+    updateAVNPaymentStatus(avn.avnID);
+    cout << "AVN status updated to 'paid'. Press Enter to continue...\n";
+    clearInputBuffer();
+    cin.get();
+}
+
+void spawnCustomAircraft(vector<Airline>& airlines, vector<Aircraft*>& activeAircrafts, int& aircraftSequence) 
+{
+    cout << "\n=== Spawn Custom Aircraft ===\n";
+    cout << "Available Airlines:\n";
+    for (size_t i = 0; i < airlines.size(); ++i) 
+        cout << i + 1 << ". " << airlines[i].name << " (" << getAircraftTypeName(airlines[i].type) << ")\n";
+    
+    int airlineChoice;
+	string input;
+    Airline* selectedAirline = nullptr;
+    bool validAirline = false;
+    while (!validAirline) 
+    {
+        cout << "Select airline (1-" << airlines.size() << "): ";
+        getline(cin, input);
+
+        if (!isValidInteger(input, airlineChoice, 1, airlines.size())) 
+        {
+            cout << "Invalid airline selection. Press Enter to continue...\n";
+			clearInputBuffer();
+            continue;
+        }
+
+        selectedAirline = &airlines[airlineChoice - 1];
+        if (selectedAirline->type == CARGO && cargoCreated) 
+            cout << "Error: Only one cargo flight is allowed per simulation.\n";
+        else
+            validAirline = true;
+    }
+
+    string flightNumber;
+    while (true)
+    {
+        cout << "Enter flight number (e.g., PK101): ";
+        getline(cin, flightNumber);
+        if (flightNumber.empty() || flightNumber.length() > 10) 
+        {
+            cout << "Invalid flight number. Press Enter to continue...\n";
+            clearInputBuffer();
+            continue;
+        }
+        bool isUnique = true;
+        for (const auto* aircraft : activeAircrafts) 
+        {
+            if (aircraft->flightNumber == flightNumber) 
+            {
+                isUnique = false;
+                break;
+            }
+        }
+
+        if (!isUnique) 
+        {
+            cout << "Error: Flight number already in use. Press Enter to continue...\n";
+            clearInputBuffer();
+            continue;
+        }
+        break;
+    }
+
+    int dirChoice;
+    while (true) 
+    {
+        cout << "Select direction (1. North, 2. South, 3. East, 4. West): ";
+        getline(cin, input);
+        if (isValidInteger(input, dirChoice, 1, 4)) 
+            break;
+        cout << "Invalid input. Press Enter to continue...\n";
+        clearInputBuffer();
+    }
+
+    Direction direction = static_cast<Direction>(dirChoice - 1);
+
+    int priChoice;
+    while (true) 
+    {
+        cout << "Select priority (1. Emergency, 2. High, 3. Normal): ";
+        getline(cin, input);
+        if (isValidInteger(input, priChoice, 1, 3)) 
+            break;
+        cout << "Invalid input. Press Enter to continue...\n";
+        clearInputBuffer();
+    }
+
+    Priority priority = static_cast<Priority>(priChoice - 1);
+
+    string schedTimeStr;
+    struct tm tm = {};
+    time_t scheduledTime;
+    while (true) {
+        cout << "Enter scheduled time (YYYY-MM-DD HH:MM) or 'now': ";
+        getline(cin, schedTimeStr);
+        
+        string lowerInput = schedTimeStr;
+        transform(lowerInput.begin(), lowerInput.end(), lowerInput.begin(), ::tolower);
+        if (lowerInput == "now") 
+        {
+            scheduledTime = time(nullptr);
+            break;
+        }
+
+        if (isValidTimeFormat(schedTimeStr, tm)) 
+        {
+            scheduledTime = mktime(&tm);
+            break;
+        }
+        cout << "Invalid input. Use YYYY-MM-DD HH:MM with valid ranges or 'now'.\nPress Enter to continue...\n";
+        clearInputBuffer();
+    }
+
+    Aircraft* newAircraft = createAircraftForManualEntry(airlines, direction, ++aircraftSequence, flightNumber, selectedAirline->type, priority, scheduledTime);
+    activeAircrafts.push_back(newAircraft);
+
+    if (selectedAirline->type == CARGO) 
+        cargoCreated = true;
+
+    cout << "Flight " << flightNumber << " spawned successfully.\n";
+}
+
+void spawnRandomAircraft(vector<Airline>& airlines, vector<Aircraft*>& activeAircrafts, int& aircraftSequence) 
+{
+    cout << "\n=== Spawn Random Aircraft ===\n";
+    Direction direction = static_cast<Direction>(rand() % 4); 
+    Aircraft* newAircraft = createAircraftForAutoEntry(airlines, direction, ++aircraftSequence);
+    activeAircrafts.push_back(newAircraft);
+
+    cout << "Random flight " << newAircraft->flightNumber << " spawned from " << getDirectionName(direction) << " direction.\n";
+}
+
+void startSimulation(vector<Airline>& airlines, vector<Runway>& runways, vector<Aircraft*>& activeAircrafts, int& aircraftSequence) 
+{
+    lock_guard<mutex> guard(simulationMutex);
+    if (!simulationRunning) {
+        simulationRunning = true;
+        simulationPaused = true; 
+        simulationThread = thread(runSimulation, ref(airlines), ref(runways), ref(activeAircrafts), ref(aircraftSequence));
+        simulationThread.detach();
+    }
+}
+
+void runSimulation(vector<Airline>& airlines, vector<Runway>& runways, vector<Aircraft*>& activeAircrafts, int& aircraftSequence) 
+{
+    while (simulationRunning && globalElapsedTime < SIMULATION_DURATION) 
+        this_thread::sleep_for(chrono::milliseconds(100));
+
+    lock_guard<mutex> guard(simulationMutex);
+    if (simulationRunning) 
+    {
+        simulationRunning = false;
+        simulationPaused = true;
+        lock_guard<mutex> coutGuard(coutMutex);
+        cout << "\nSimulation completed.\n";
+        displayAVNStatistics(airlines);
+    }
+}
+
+void visualizeSimulation(sf::RenderWindow& window, const vector<Aircraft*>& aircrafts, const vector<Runway>& runways, int elapsedTime) 
+{
+    window.clear(sf::Color::Black);
+    sf::Font font;
+    if (!font.loadFromFile("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")) 
+    {
+        return;
+    }
+
+    vector<sf::RectangleShape> runwayShapes(3);
+    for (size_t i = 0; i < runways.size(); ++i) 
+    {
+        runwayShapes[i].setSize(sf::Vector2f(400, 30));
+        runwayShapes[i].setPosition(50, 50 + i * 100);
+        runwayShapes[i].setFillColor(runways[i].isOccupied ? sf::Color::Red : sf::Color::Green);
+
+        sf::Text label(runways[i].name, font, 14);
+        label.setPosition(10, 50 + i * 100);
+        label.setFillColor(sf::Color::White);
+        window.draw(label);
+
+        sf::Text queueText("Waiting: " + to_string(runways[i].waitingQueue.size()), font, 14);
+        queueText.setPosition(460, 50 + i * 100);
+        queueText.setFillColor(sf::Color::White);
+        window.draw(queueText);
+
+        window.draw(runwayShapes[i]);
+    }
+
+    for (const auto& aircraft : aircrafts) 
+    {
+        if (aircraft->isFaulty) continue;
+
+        sf::RectangleShape aircraftShape(sf::Vector2f(20, 20));
+        switch (aircraft->priority) 
+        {
+            case EMERGENCY_PRIORITY: aircraftShape.setFillColor(sf::Color::Red); break;
+            case HIGH_PRIORITY: aircraftShape.setFillColor(sf::Color::Yellow); break;
+            case NORMAL_PRIORITY: aircraftShape.setFillColor(sf::Color::Blue); break;
+        }
+
+        float x = 50, y = 0; 
+        float progress = static_cast<float>(aircraft->timeInFlight) / 25.0f; 
+
+        if (aircraft->phase == HOLDING || aircraft->phase == APPROACH) 
+        {
+            size_t hash = std::hash<std::string>{}(aircraft->flightNumber) % 3;  
+            float angle = aircraft->timeInFlight * 0.1f + hash * 2.0f;        
+            x = 600 + cos(angle) * (50 + hash * 20);                  
+            y = 100 + sin(angle) * (50 + hash * 20);
+        } 
+        else if (aircraft->phase == LANDING || aircraft->phase == TAXI) 
+        {
+            for (size_t i = 0; i < runways.size(); ++i) 
+            {
+                if (runways[i].currentAircraft == aircraft && (runways[i].id == RWY_A || runways[i].id == RWY_C)) 
+                {
+                    y = 50 + i * 100 + 5;
+                    x = 50 + (progress * 400.0f); 
+                    if (x > 450) x = 450; 
+                    break;
+                }
+            }
+        } 
+        else if (aircraft->phase == TAKEOFF_ROLL || aircraft->phase == CLIMB) 
+        {
+            for (size_t i = 0; i < runways.size(); ++i) 
+            {
+                if (runways[i].currentAircraft == aircraft && (runways[i].id == RWY_B || runways[i].id == RWY_C)) 
+                {
+                    y = 50 + i * 100 + 5;
+                    x = 50 + (progress * 400.0f); 
+                    if (x > 450) x = 450; 
+                    break;
+                }
+            }
+        } 
+        else if (aircraft->phase == AT_GATE || aircraft->phase == AT_GATE_BRS) 
+        {
+            size_t hash = std::hash<std::string>{}(aircraft->flightNumber) % 5; 
+            x = 50 + (hash * 50); 
+            y = 350;
+        } 
+        else 
+        {
+            x = 600; 
+            y = 100;
+        }
+
+        aircraftShape.setPosition(x, y);
+        window.draw(aircraftShape);
+
+        size_t hash = std::hash<std::string>{}(aircraft->flightNumber) % 3; 
+        string statusText = aircraft->flightNumber + ": " + aircraft->status + " (Fuel: " +
+                            to_string(aircraft->fuelStatus) + "%, Alt: " + to_string((int)aircraft->altitude) + "ft)";
+        sf::Text aircraftText(statusText, font, 12);
+        aircraftText.setPosition(x, y + 25 + (hash * 15)); 
+        aircraftText.setFillColor(sf::Color::White);
+        window.draw(aircraftText);
+    }
+
+    int minutes = elapsedTime / 60;
+    int seconds = elapsedTime % 60;
+    string timeText = "Time: " + to_string(minutes) + ":" + (seconds < 10 ? "0" : "") + to_string(seconds);
+    sf::Text statusText(timeText + "\nArrivals: " + to_string(arrivalQueue.size()) +
+                        "\nDepartures: " + to_string(departureQueue.size()), font, 14);
+    statusText.setPosition(10, 400);
+    statusText.setFillColor(sf::Color::White);
+    window.draw(statusText);
+
+    window.display();
+}
+
+void showSimulation(vector<Airline>& airlines, vector<Runway>& runways, vector<Aircraft*>& activeAircrafts, int& aircraftSequence) 
+{
+    setNonBlockingInput(true);
+    {
+        lock_guard<mutex> guard(coutMutex);
+        cout << "Showing simulation. Press 'q' to return to menu.\n" << flush;
+    }
+
+    sf::RenderWindow window(sf::VideoMode(800, 600), "AirControlX Simulation");
+    window.setFramerateLimit(60);
+
+    auto startTime = chrono::steady_clock::now();
+    while (simulationRunning && globalElapsedTime < SIMULATION_DURATION && window.isOpen()) 
+    {
+        sf::Event event;
+        while (window.pollEvent(event)) 
+        {
+            if (event.type == sf::Event::Closed || (event.type == sf::Event::KeyPressed && event.key.code == sf::Keyboard::Q)) 
+                window.close();
+        }
+
+        {
+            lock_guard<mutex> guard(simulationMutex);
+            if (kbhit()) 
+            {
+                cout << "Returning to menu.\n" << flush;
+                simulationPaused = true;
+                window.close();
+                break;
+            }
+            simulationPaused = false;
+
+            updateSimulationStep(airlines, runways, activeAircrafts);
+            globalElapsedTime += TIME_STEP;
+
+            displayStatus(activeAircrafts, runways, globalElapsedTime);
+            visualizeSimulation(window, activeAircrafts, runways, globalElapsedTime);
+        }
+
+        this_thread::sleep_for(chrono::milliseconds(TIME_STEP * 1000));
+        auto elapsed = chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - startTime).count();
+        
+        if (elapsed >= 30) 
+        {
+            lock_guard<mutex> guard(coutMutex);
+            cout << "Timeout: Returning to menu.\n" << flush;
+            lock_guard<mutex> guard2(simulationMutex);
+            simulationPaused = true;
+            window.close();
+            break;
+        }
+    }
+    setNonBlockingInput(false);
+}
+
+void updateSimulationStep(vector<Airline>& airlines, vector<Runway>& runways, vector<Aircraft*>& activeAircrafts) 
+{
+    updateWaitTimes(runways);
+
+    // Process status transformations safely
+    for (auto* aircraft : activeAircrafts) {
+        updateAircraftStatus(*aircraft);
+        updateAircraftSpeed(*aircraft);
+		updateAircraftAltitude(*aircraft);
+
+        if (aircraft->direction == NORTH || aircraft->direction == SOUTH)
+            simulateArrival(*aircraft, runways);
+        else
+            simulateDeparture(*aircraft, runways);
+    }
+
+    if (globalElapsedTime % 30 == 0)
+        handleGroundFaults(activeAircrafts);
+
+    // Dynamic garbage pruning step decoupled from operational transformations
+    for (auto it = activeAircrafts.begin(); it != activeAircrafts.end(); ) 
+    {
+        Aircraft* aircraft = *it;
+        if (aircraft->isFaulty || 
+           ((globalElapsedTime % 7 == 0 && globalElapsedTime != 0) && 
+            (aircraft->phase == AT_GATE_BRS || aircraft->phase == DEPARTURE_CRUISE_BRS))) 
+        {
+            removeAircraftFromEverywhere(aircraft, activeAircrafts, runways);
+            // removeAircraftFromEverywhere modifies activeAircrafts internally, updating iterator
+            it = find(activeAircrafts.begin(), activeAircrafts.end(), aircraft);
+        } 
+        else 
+        {
+            it++;
+        }
+    }
+
+    for (auto* aircraft : activeAircrafts) 
+        checkForViolations(*aircraft);
+
+    for (auto& aircraft : activeAircrafts) 
+        if (!isAircraftWaiting(*aircraft, runways)) 
+            aircraft->timeInFlight++;
+}
+
+bool kbhit() 
+{
+    char c;
+    if (read(STDIN_FILENO, &c, 1) == 1) {
+        return c == 'q';
+    }
+    return false;
+}
+
+void initializeAirlines(vector<Airline>& airlines) 
+{
+    airlines = 
+    {
+        {"PIA", COMMERCIAL, 6, 4, 0},
+        {"AirBlue", COMMERCIAL, 4, 4, 0},
+        {"FedEx", CARGO, 3, 2, 0},
+        {"Pakistan Airforce", EMERGENCY, 2, 1, 0},
+        {"Blue Dart", CARGO, 2, 2, 0},
+        {"AghaKhan Air Ambulance", EMERGENCY, 2, 1, 0}
+    };
+}
+
+void initializeRunways(vector<Runway>& runways) 
+{
+    runways = 
+    {
+        {RWY_A, "RWY-A (North-South Arrivals)", false, nullptr},
+        {RWY_B, "RWY-B (East-West Departures)", false, nullptr},
+        {RWY_C, "RWY-C (Cargo/Emergency/Overflow)", false, nullptr}
+    };
+}
+
+string generateFlightNumber(const Airline& airline, int sequence) 
+{
+    string prefix = "FL";
+    if (airline.name == "PIA") prefix = "PK";
+    else if (airline.name == "AirBlue") prefix = "PA";
+    else if (airline.name == "FedEx") prefix = "FX";
+    else if (airline.name == "Pakistan Airforce") prefix = "PF";
+    else if (airline.name == "Blue Dart") prefix = "BD";
+    else if (airline.name == "AghaKhan Air Ambulance") prefix = "AK";
+
+    return prefix + to_string(100 + sequence);
+}
+
+Aircraft* createAircraftForManualEntry(vector<Airline>& airlines, Direction direction, int seq, string flightNum, AircraftType type, Priority priority, time_t schedTime) 
+{
+    Aircraft* aircraft = new Aircraft();
+    Airline* selectedAirline = nullptr;
+    for (auto& airline : airlines) 
+    {
+        if (airline.type == type) 
+        {
+            selectedAirline = &airline;
+            break;
+        }
+    }
+
+    if (!selectedAirline) selectedAirline = &airlines[0];
+
+    aircraft->flightNumber = flightNum;
+    aircraft->airline = selectedAirline;
+    aircraft->type = selectedAirline->type;
+    aircraft->direction = direction;
+    aircraft->isEmergency = (priority == EMERGENCY_PRIORITY);
+    aircraft->hasAVN = false;
+    aircraft->isFaulty = false;
+    aircraft->fuelStatus = 20 + rand() % 60;
+    aircraft->scheduledTime = schedTime;
+    aircraft->priority = priority;
+
+    if (direction == NORTH || direction == SOUTH) 
+    {
+        aircraft->phase = HOLDING;
+        aircraft->speed = 555 + rand() % 10; 
+        aircraft->altitude = 19000 + (rand() % 1000); 
+        arrivalQueue.push(aircraft);
+    } 
+    else 
+    {
+        aircraft->phase = AT_GATE;
+        aircraft->speed = 0;
+        aircraft->altitude = 0; 
+        departureQueue.push(aircraft);
+    }
+
+    aircraftStatusMap[aircraft->flightNumber] = aircraft;
+    return aircraft;
+}
+
+Aircraft* createAircraftForAutoEntry(const vector<Airline>& airlines, Direction direction, int seq) 
+{
+    Aircraft* aircraft = new Aircraft();
+    int emergencyProb = 0;
+
+    switch (direction) 
+    {
+        case NORTH: emergencyProb = 10; break; 
+        case SOUTH: emergencyProb = 5; break;  
+        case EAST: emergencyProb = 15; break; 
+        case WEST: emergencyProb = 20; break; 
+    }
+
+    bool isEmergency = (rand() % 100) < emergencyProb;
+
+    vector<const Airline*> emergencyEligibleAirlines;
+    for (const auto& airline : airlines) 
+    {
+        if (isEmergency && (airline.type == EMERGENCY))
+            emergencyEligibleAirlines.push_back(&airline);
+        else if (!isEmergency && (airline.type != EMERGENCY))
+            emergencyEligibleAirlines.push_back(&airline);
+    }
+
+    vector<const Airline*> eligibleAirlines;
+    if (!isEmergency) 
+    {
+        for (const auto& airline : emergencyEligibleAirlines) 
+        {
+            if (cargoCreated && airline->type == CARGO)
+                continue;
+            else
+                eligibleAirlines.push_back(airline);
+        }
+    }
+
+    if (eligibleAirlines.empty()) 
+        eligibleAirlines.push_back(&airlines[0]);
+    
+
+    const Airline* selectedAirline = eligibleAirlines[rand() % eligibleAirlines.size()];
+    if (selectedAirline->type == CARGO)
+        cargoCreated = true;
+
+    aircraft->flightNumber = generateFlightNumber(*selectedAirline, seq);
+    aircraft->airline = const_cast<Airline*>(selectedAirline);
+    aircraft->type = selectedAirline->type;
+    aircraft->direction = direction;
+    aircraft->isEmergency = isEmergency;
+    aircraft->hasAVN = false;
+    aircraft->isFaulty = false;
+    aircraft->fuelStatus = 20 + rand() % 60;
+    aircraft->scheduledTime = time(nullptr);
+
+    if (aircraft->isEmergency || aircraft->type == EMERGENCY) 
+        aircraft->priority = EMERGENCY_PRIORITY;
+    else if (aircraft->type == CARGO || aircraft->fuelStatus < 30)
+        aircraft->priority = HIGH_PRIORITY;
+    else 
+        aircraft->priority = NORMAL_PRIORITY;
+    
+    if (direction == NORTH || direction == SOUTH) 
+    {
+        aircraft->phase = HOLDING;
+        aircraft->speed = 555 + rand() % 10; 
+        aircraft->altitude = 19000 + (rand() % 1000); 
+        arrivalQueue.push(aircraft);
+        if (aircraft->fuelStatus < 30 && aircraft->priority == HIGH_PRIORITY) 
+        {
+            rebuildQueue(aircraft, arrivalQueue);
+        }
+    } 
+    else 
+    {
+        aircraft->phase = AT_GATE;
+        aircraft->speed = 0;
+        aircraft->altitude = 0;
+        departureQueue.push(aircraft);
+        if (aircraft->fuelStatus < 30 && aircraft->priority == HIGH_PRIORITY) 
+        {
+            rebuildQueue(aircraft, departureQueue);
+        }
+    }
+
+    aircraftStatusMap[aircraft->flightNumber] = aircraft;
+    return aircraft;
+}
+
+void simulateArrival(Aircraft& aircraft, vector<Runway>& runways) 
+{
+    if (isAircraftWaiting(aircraft, runways)) 
+        return;
+
+    switch (aircraft.phase) 
+    {
+        case HOLDING:
+            if (aircraft.timeInFlight >= 5) 
+            {
+                aircraft.phase = APPROACH;
+                aircraft.status = "Approaching";
+                aircraft.fuelStatus -= 2;
+            }
+            break;
+
+        case APPROACH: 
+        {
+            Runway* assignedRunway = assignRunway(aircraft, runways);
+            if (assignedRunway && aircraft.timeInFlight >= 9) 
+            {
+                aircraft.phase = LANDING;
+                aircraft.status = "Landing";
+                aircraft.fuelStatus -= 2;
+            }
+            break;
+        }
+
+        case LANDING:
+            if (aircraft.timeInFlight >= 14) 
+            {
+                aircraft.phase = TAXI;
+                aircraft.status = "Taxiing";
+                aircraft.fuelStatus -= 2;
+
+                for (auto& runway : runways) 
+                {
+                    if (runway.currentAircraft == &aircraft) 
+                    {
+                        runway.isOccupied = false;
+                        runway.currentAircraft = nullptr;
+
+                        if (!runway.waitingQueue.empty()) 
+                        {
+                            Aircraft* nextAircraft = runway.waitingQueue.front();
+                            runway.waitingQueue.pop();
+                            runway.currentAircraft = nextAircraft;
+                            runway.isOccupied = true;
+                            nextAircraft->status = "Approaching Runway";
+                        }
+                        break;
+                    }
+                }
+            }
+            break;
+
+        case TAXI:
+            if (aircraft.timeInFlight >= 17) 
+            {
+                aircraft.phase = AT_GATE;
+                aircraft.status = "At Gate";
+                aircraft.fuelStatus -= 2;
+            }
+            break;
+
+        case AT_GATE:
+            if (aircraft.timeInFlight >= 20 && aircraft.speed <= 0) 
+            {
+                aircraft.phase = AT_GATE_BRS;
+                aircraft.status = "Completed";
+                aircraft.fuelStatus -= 1;
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+void simulateDeparture(Aircraft& aircraft, vector<Runway>& runways) 
+{
+    if (isAircraftWaiting(aircraft, runways)) 
+        return;    
+
+    switch (aircraft.phase) 
+    {
+        case AT_GATE:
+            if (aircraft.timeInFlight >= 3) 
+            {
+                aircraft.phase = TAXI;
+                aircraft.status = "Taxiing";
+                aircraft.fuelStatus -= 2;
+            }
+            break;
+
+        case TAXI: 
+        {
+            Runway* assignedRunway = assignRunway(aircraft, runways);
+            if (assignedRunway && aircraft.timeInFlight >= 6) 
+            {
+                aircraft.phase = TAKEOFF_ROLL;
+                aircraft.status = "Taking Off";
+                aircraft.fuelStatus -= 2;
+            }
+            break;
+        }
+
+        case TAKEOFF_ROLL:
+            if (aircraft.timeInFlight >= 12) 
+            {
+                aircraft.phase = CLIMB;
+                aircraft.status = "Climbing";
+                aircraft.fuelStatus -= 2;
+                
+                for (auto& runway : runways) 
+                {
+                    if (runway.currentAircraft == &aircraft) 
+                    {
+                        runway.isOccupied = false;
+                        runway.currentAircraft = nullptr;
+
+                        if (!runway.waitingQueue.empty()) {
+                            Aircraft* nextAircraft = runway.waitingQueue.front();
+                            runway.waitingQueue.pop();
+                            runway.currentAircraft = nextAircraft;
+                            runway.isOccupied = true;
+                            nextAircraft->status = "Taking Off";
+                        }
+                        break;
+                    }
+                }
+            }
+            break;
+
+        case CLIMB:
+            if (aircraft.timeInFlight >= 16) 
+            {
+                aircraft.phase = ACCELERATING_TO_CRUISE;
+                aircraft.status = "Accelerating";
+                aircraft.fuelStatus -= 2;
+            }
+            break;
+
+        case ACCELERATING_TO_CRUISE:
+            if (aircraft.timeInFlight >= 23) 
+            {
+                aircraft.phase = DEPARTURE_CRUISE;
+                aircraft.status = "Cruising";
+                aircraft.fuelStatus -= 3;
+            }
+            break;
+
+        case DEPARTURE_CRUISE:
+            if (aircraft.timeInFlight >= 25) 
+            {
+                aircraft.phase = DEPARTURE_CRUISE_BRS;
+                aircraft.status = "Completed";
+                aircraft.fuelStatus -= 4;
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+Runway* assignRunway(Aircraft& aircraft, vector<Runway>& runways) 
+{
+    for (auto& runway : runways) 
+    {
+        if (runway.currentAircraft == &aircraft) 
+            return &runway;        
+    }
+
+    for (auto& runway : runways) 
+    {
+        queue<Aircraft*> tempQueue = runway.waitingQueue;
+        while (!tempQueue.empty()) 
+        {
+            Aircraft* queuedAircraft = tempQueue.front();
+            tempQueue.pop();
+            if (queuedAircraft == &aircraft)
+                return &runway;
+        }
+    }
+
+    Runway* assignedRunway = nullptr;
+    if (aircraft.priority == EMERGENCY_PRIORITY) 
+    {
+        if (!runways[RWY_C].isOccupied) assignedRunway = &runways[RWY_C];
+        else if (!runways[RWY_A].isOccupied) assignedRunway = &runways[RWY_A];
+        else if (!runways[RWY_B].isOccupied) assignedRunway = &runways[RWY_B];
+        else 
+        {
+            assignedRunway = &runways[RWY_C];
+            for (auto& runway : runways) 
+            {
+                if (runway.waitingQueue.size() < assignedRunway->waitingQueue.size())
+                    assignedRunway = &runway;
+            }
+            assignedRunway->waitingQueue.push(&aircraft);
+            aircraft.status = "Waiting for Runway";
+            return nullptr;
+        }
+        assignedRunway->isOccupied = true;
+        assignedRunway->currentAircraft = &aircraft;
+        return assignedRunway;
+    }
+
+    if (aircraft.type == CARGO) 
+    {
+        if (!runways[RWY_C].isOccupied) 
+        {
+            assignedRunway = &runways[RWY_C];
+            assignedRunway->isOccupied = true;
+            assignedRunway->currentAircraft = &aircraft;
+            return assignedRunway;
+        } 
+        else 
+        {
+            runways[RWY_C].waitingQueue.push(&aircraft);
+            aircraft.status = "Waiting for Runway";
+            return nullptr;
+        }
+    }
+
+    if (aircraft.direction == NORTH || aircraft.direction == SOUTH) 
+    {
+        if (!runways[RWY_A].isOccupied) assignedRunway = &runways[RWY_A];
+        else if (!runways[RWY_C].isOccupied) assignedRunway = &runways[RWY_C];
+        else 
+        {
+            assignedRunway = &runways[RWY_A];
+            if (runways[RWY_C].waitingQueue.size() < assignedRunway->waitingQueue.size())
+                assignedRunway = &runways[RWY_C];
+            assignedRunway->waitingQueue.push(&aircraft);
+            aircraft.status = "Waiting for Runway";
+            return nullptr;
+        }
+        assignedRunway->isOccupied = true;
+        assignedRunway->currentAircraft = &aircraft;
+        return assignedRunway;
+    } 
+    else 
+    {
+        if (!runways[RWY_B].isOccupied) assignedRunway = &runways[RWY_B];
+        else if (!runways[RWY_C].isOccupied) assignedRunway = &runways[RWY_C];
+        else 
+        {
+            assignedRunway = &runways[RWY_B];
+            if (runways[RWY_C].waitingQueue.size() < assignedRunway->waitingQueue.size())
+                assignedRunway = &runways[RWY_C];
+            assignedRunway->waitingQueue.push(&aircraft);
+            aircraft.status = "Waiting for Runway";
+            return nullptr;
+        }
+        assignedRunway->isOccupied = true;
+        assignedRunway->currentAircraft = &aircraft;
+        return assignedRunway;
+    }
+}
+
+void updateWaitTimes(vector<Runway>& runways) 
+{
+    for (auto& pair : aircraftStatusMap) 
+    {
+        Aircraft* aircraft = pair.second;
+        if (aircraft->status == "Waiting for Runway") 
+        {
+            aircraft->actualWaitTime++;
+            if (aircraft->actualWaitTime >= AGING_THRESHOLD && aircraft->priority == NORMAL_PRIORITY) 
+            {
+                aircraft->priority = HIGH_PRIORITY;
+                priority_queue<Aircraft*, vector<Aircraft*>, ComparePriority>& queue = (aircraft->direction == NORTH || aircraft->direction == SOUTH) ? arrivalQueue : departureQueue;
+                rebuildQueue(aircraft, queue);
+            }
+        }
+        aircraft->estimatedWaitTime = calculateEstimatedWaitTime(*aircraft, runways);
+    }
+}
+
+int calculateEstimatedWaitTime(Aircraft& aircraft, const vector<Runway>& runways) 
+{
+    if ((aircraft.direction == NORTH || aircraft.direction == SOUTH) &&
+        (aircraft.phase == LANDING || aircraft.phase == TAXI || aircraft.phase == AT_GATE || aircraft.phase == AT_GATE_BRS)) 
+        return 0;
+    
+    if ((aircraft.direction == EAST || aircraft.direction == WEST) &&
+        (aircraft.phase == TAKEOFF_ROLL || aircraft.phase == CLIMB || aircraft.phase == ACCELERATING_TO_CRUISE ||
+         aircraft.phase == DEPARTURE_CRUISE || aircraft.phase == DEPARTURE_CRUISE_BRS)) 
+        return 0;
+    
+
+    int estimatedWait = 0;
+
+    if (isAircraftWaiting(aircraft, runways)) 
+    {
+        for (const auto& runway : runways) 
+        {
+            queue<Aircraft*> tempQueue = runway.waitingQueue;
+            int position = 0;
+            bool found = false;
+            vector<Aircraft*> higherOrEqualPriority;
+
+            while (!tempQueue.empty()) 
+            {
+                Aircraft* queuedAircraft = tempQueue.front();
+                tempQueue.pop();
+                
+                if (queuedAircraft == &aircraft) 
+                    found = true;
+                
+                if (queuedAircraft->priority <= aircraft.priority)  
+                    higherOrEqualPriority.push_back(queuedAircraft);
+            }
+
+            if (found) 
+            {
+                sort(higherOrEqualPriority.begin(), higherOrEqualPriority.end(),
+                     [](Aircraft* a, Aircraft* b) { return a->scheduledTime < b->scheduledTime; });
+
+                for (size_t i = 0; i < higherOrEqualPriority.size(); ++i) 
+                {
+                    if (higherOrEqualPriority[i] == &aircraft) 
+                    {
+                        position = i;
+                        break;
+                    }
+                }
+
+                estimatedWait = position * AVG_RUNWAY_USAGE_TIME;
+                if (runway.isOccupied && runway.currentAircraft)                     
+                    estimatedWait += AVG_RUNWAY_USAGE_TIME;
+                break;
+            }
+        }
+    } 
+    else 
+    {
+        if (aircraft.direction == NORTH || aircraft.direction == SOUTH) 
+        {
+            if (aircraft.phase == HOLDING) estimatedWait = 9; 
+            else if (aircraft.phase == APPROACH) estimatedWait = 4; 
+        } 
+        else 
+        {
+            if (aircraft.phase == AT_GATE) estimatedWait = 6; 
+            else if (aircraft.phase == TAXI) estimatedWait = 3; 
+        }
+
+        priority_queue<Aircraft*, vector<Aircraft*>, ComparePriority> queueCopy =
+            (aircraft.direction == NORTH || aircraft.direction == SOUTH) ? arrivalQueue : departureQueue;
+        int aheadCount = 0;
+
+        while (!queueCopy.empty()) {
+            Aircraft* queuedAircraft = queueCopy.top();
+            queueCopy.pop();
+            if (queuedAircraft != &aircraft && queuedAircraft->priority <= aircraft.priority) 
+                aheadCount++;            
+        }
+        estimatedWait += aheadCount * AVG_RUNWAY_USAGE_TIME;
+
+        for (const auto& runway : runways) 
+        {
+            if (runway.isOccupied && runway.currentAircraft &&
+                ((((aircraft.direction == NORTH || aircraft.direction == SOUTH) && (runway.id == RWY_A || runway.id == RWY_C))) ||
+                 (((aircraft.direction == EAST || aircraft.direction == WEST) && (runway.id == RWY_B || runway.id == RWY_C))))) 
+            {
+                     estimatedWait += AVG_RUNWAY_USAGE_TIME;
+            }
+        }
+    }
+    return estimatedWait;
+}
+
+void updateAircraftStatus(Aircraft& aircraft) 
+{
+    if (aircraft.status == "Waiting for Runway") 
+        return;    
+
+    switch (aircraft.phase) 
+    {
+        case HOLDING: aircraft.status = "Holding Pattern"; break;
+        case APPROACH: aircraft.status = "Approaching"; break;
+        case LANDING: aircraft.status = "Landing"; break;
+        case TAXI: aircraft.status = "Taxiing"; break;
+        case AT_GATE: aircraft.status = "At Gate"; break;
+        case TAKEOFF_ROLL: aircraft.status = "Taking Off"; break;
+        case CLIMB: aircraft.status = "Climbing"; break;
+        case DEPARTURE_CRUISE: aircraft.status = "Cruising"; break;
+        case ACCELERATING_TO_CRUISE: aircraft.status = "Accelerating"; break;
+        default: break;
+    }
+}
+
+int calculateSpeedChange(const Aircraft& aircraft)
+{
+    int speedChange = 0;
+    if (aircraft.phase == TAKEOFF_ROLL || aircraft.phase == CLIMB)
+        speedChange = rand() % 18 + 30;
+    else if (aircraft.phase == LANDING)
+        speedChange = 38 + rand() % 10;
+    else if (aircraft.phase == HOLDING)
+        speedChange = rand() % 10 + 42;
+    else if (aircraft.phase == TAXI)
+        speedChange = rand() % 5 + 4;
+    else if (aircraft.phase == AT_GATE)
+        speedChange = rand() % 3 + 2;
+    else if (aircraft.phase == APPROACH)
+        speedChange = rand() % 5 + 11;
+    else if (aircraft.phase == ACCELERATING_TO_CRUISE)
+        speedChange = rand() % 26 + 50;
+    else if (aircraft.phase == DEPARTURE_CRUISE)
+        speedChange = rand() % 8 + 18;
+
+    return speedChange;
+}
+
+double calculateAltitudeChange(const Aircraft& aircraft) 
+{
+    double altitudeChange = 0;
+    switch (aircraft.phase) 
+    {
+        case HOLDING: altitudeChange = 1800 + rand() % 200; break;
+        case APPROACH: altitudeChange = 1700 + rand() % 50; break;
+        case LANDING: altitudeChange = 500 + rand() % 100; break;
+        case TAXI:
+        case AT_GATE:
+        case AT_GATE_BRS: altitudeChange = 0; break;
+        case TAKEOFF_ROLL: altitudeChange = 150 + rand() % 30; break;
+        case CLIMB: altitudeChange = 4600 + rand() % 250; break;
+        case ACCELERATING_TO_CRUISE: altitudeChange = 1400 + rand() % 25; break;
+        case DEPARTURE_CRUISE: altitudeChange = 3000 + rand() % 1000; break;
+        default: altitudeChange = 0; break;
+    }
+    return altitudeChange;
+}
+
+void updateAircraftSpeed(Aircraft& aircraft) 
+{
+    if (aircraft.status == "Waiting for Runway") 
+    {
+        if (aircraft.direction == NORTH || aircraft.direction == SOUTH) 
+            aircraft.speed = 240 + rand() % 51; 
+        else 
+            aircraft.speed = 0;        
+        return;
+    }
+
+    int speedChange = calculateSpeedChange(aircraft);
+    if (aircraft.direction == NORTH || aircraft.direction == SOUTH)
+        aircraft.speed -= speedChange;
+    else
+        aircraft.speed += speedChange;
+
+    if (aircraft.speed < 0) 
+    {
+        if (aircraft.phase != AT_GATE)
+            aircraft.speed = (rand() % 10) + 10;
+        else
+            aircraft.speed = 0;
+    }
+}
+
+void updateAircraftAltitude(Aircraft& aircraft) 
+{    
+    if (aircraft.status == "Waiting for Runway") 
+    {
+        if (aircraft.direction == NORTH || aircraft.direction == SOUTH) 
+        {        
+            double altitudeChange = (rand() % 101 - 50); 
+            aircraft.altitude += altitudeChange;
+        } 
+        else 
+            aircraft.altitude = 0;        
+        return;
+    }
+
+    double altitudeChange = calculateAltitudeChange(aircraft);
+    if (aircraft.direction == NORTH || aircraft.direction == SOUTH)
+        aircraft.altitude -= altitudeChange; 
+    else
+        aircraft.altitude += altitudeChange; 
+
+    if (aircraft.altitude < 0) {
+        aircraft.altitude = (aircraft.status == "Landing" || aircraft.status == "Approaching") ? 100 + rand() % 11 : 0;
+    }
+}
+
+void generateAVN(Aircraft& aircraft, bool speedViolation, bool altitudeViolation) 
+{
+    AVN avn;
+    time_t now = time(nullptr);
+    struct tm* tm = localtime(&now);
+    char dateStr[11];
+    strftime(dateStr, sizeof(dateStr), "%Y%m%d", tm);
+
+    ostringstream seqStream;
+    seqStream << setw(3) << setfill('0') << ++avnSequence;
+    avn.avnID = "AVN-" + string(dateStr) + "-" + seqStream.str();
+    avn.flightNumber = aircraft.flightNumber;
+    avn.airlineName = aircraft.airline->name;
+    avn.aircraftType = aircraft.type;
+    avn.speedRecorded = aircraft.speed;
+    avn.altitudeRecorded = aircraft.altitude;
+    avn.issueTime = now;
+    avn.paymentStatus = "unpaid";
+    avn.dueDate = now + DUE_DAYS * 24 * 60 * 60;
+    double baseFine = (aircraft.type == CARGO) ? CARGO_FINE : COMMERCIAL_FINE;
+    avn.fineAmount = baseFine * (1.0 + SERVICE_FEE);
+    
+    switch (aircraft.phase) 
+    {
+        case HOLDING: avn.speedPermissible = "<=600"; avn.altitudePermissible = "9000-20000"; break;
+        case APPROACH: avn.speedPermissible = "240-290"; avn.altitudePermissible = "3000-10250"; break;
+        case LANDING: avn.speedPermissible = "<=240"; avn.altitudePermissible = "0-3100"; break;
+        case TAXI: avn.speedPermissible = "<=30"; avn.altitudePermissible = "0"; break;
+        case AT_GATE: avn.speedPermissible = "<=10"; avn.altitudePermissible = "0"; break;
+        case TAKEOFF_ROLL: avn.speedPermissible = "<=290"; avn.altitudePermissible = "0-1000"; break;
+        case CLIMB: avn.speedPermissible = "<=463"; avn.altitudePermissible = "900-20000"; break;
+        case DEPARTURE_CRUISE: avn.speedPermissible = "800-900"; avn.altitudePermissible = "29000-40000"; break;
+        default: avn.speedPermissible = "N/A"; avn.altitudePermissible = "N/A"; break;
+    }
+
+    {
+        lock_guard<mutex> avnGuard(avnListMutex);
+        avnList.push_back(avn);
+    }
+
+    lock_guard<mutex> guard(coutMutex);
+    cout << "\n[AVN ISSUED] ID: " << avn.avnID << " | Flight: " << avn.flightNumber << " | Airline: " << avn.airlineName;
+    if (speedViolation) cout << " | Speed Violation: " << avn.speedRecorded << " km/h";
+    if (altitudeViolation) cout << " | Altitude Violation: " << avn.altitudeRecorded << " ft";
+    cout << " | Fine: PKR " << avn.fineAmount << "\n";
+}
+
+void updateAVNPaymentStatus(const string& avnID) 
+{
+    lock_guard<mutex> guard(coutMutex);
+    for (auto& avn : avnList) 
+    {
+        if (avn.avnID == avnID) 
+        {
+            avn.paymentStatus = "paid";
+            auto it = aircraftStatusMap.find(avn.flightNumber);
+            if (it != aircraftStatusMap.end()) 
+            {
+                Aircraft* aircraft = it->second;
+                aircraft->hasAVN = false;
+            }
+            cout << "PAYMENT CONFIRMED: AVN ID=" << avnID << " | Status=paid\n";
+            return;
+        }
+    }    
+}
+
+void checkForViolations(Aircraft& aircraft) 
+{
+    bool speedViolation = false;
+    bool altitudeViolation = false;
+
+    switch (aircraft.phase) 
+    {
+        case HOLDING:
+            speedViolation = (aircraft.speed > 600);
+            altitudeViolation = (aircraft.altitude < 9000 || aircraft.altitude > 20000);
+            break;
+        case APPROACH:
+            speedViolation = (aircraft.speed < 240 || aircraft.speed > 290);
+            altitudeViolation = (aircraft.altitude < 3000 || aircraft.altitude > 10250);
+            break;
+        case LANDING:
+            speedViolation = (aircraft.speed > 240);
+            altitudeViolation = (aircraft.altitude > 3100);
+            break;
+        case TAXI:
+            speedViolation = (aircraft.speed > 30);
+            altitudeViolation = (aircraft.altitude != 0);
+            break;
+        case AT_GATE:
+            speedViolation = (aircraft.speed > 10);
+            altitudeViolation = (aircraft.altitude != 0);
+            break;
+        case TAKEOFF_ROLL:
+            speedViolation = (aircraft.speed > 290);
+            altitudeViolation = (aircraft.altitude > 1000);
+            break;
+        case CLIMB:
+            speedViolation = (aircraft.speed > 463);
+            altitudeViolation = (aircraft.altitude < 900 || aircraft.altitude > 20000);
+            break;
+        case DEPARTURE_CRUISE:
+            speedViolation = (aircraft.speed < 800 || aircraft.speed > 900);
+            altitudeViolation = (aircraft.altitude < 29000 || aircraft.altitude > 40000);
+            break;
+        default: break;
+    }
+
+    if ((speedViolation || altitudeViolation) && !aircraft.hasAVN) 
+    {
+        aircraft.hasAVN = true;
+        aircraft.airline->violations++;
+        generateAVN(aircraft, speedViolation, altitudeViolation);
+    }
+}
+
+void handleGroundFaults(vector<Aircraft*>& aircrafts) 
+{
+    for (auto& aircraft : aircrafts) 
+    {
+        if ((aircraft->phase == TAXI || aircraft->phase == AT_GATE) && !aircraft->isFaulty) 
+        {
+            if (rand() % 100 < 5) 
+            {
+                aircraft->isFaulty = true;
+                lock_guard<mutex> guard(coutMutex);
+                cout << "FAULT DETECTED: " << aircraft->flightNumber << " needs towing." << endl;
+            }
+        }
+    }
+}
+
+void displayStatus(const vector<Aircraft*>& aircrafts, const vector<Runway>& runways, int elapsedTime) 
+{
+    lock_guard<mutex> guard(coutMutex);
+    int minutes = elapsedTime / 60;
+    int seconds = elapsedTime % 60;
+
+    cout << "\n=== AirControlX Status [" << setw(2) << setfill('0') << minutes
+         << ":" << setw(2) << setfill('0') << seconds << "] ===\n";
+
+    for (const auto& runway : runways) 
+    {
+        cout << runway.name << ": ";
+        if (runway.isOccupied && runway.currentAircraft != nullptr) 
+            cout << "Occupied by " << runway.currentAircraft->flightNumber;
+        else
+            cout << "Available";
+        if (!runway.waitingQueue.empty()) cout << " | Waiting: " << runway.waitingQueue.size();        
+        cout << "\n";
+    }
+
+    cout << "Active Flights Tracked: " << aircrafts.size() << "\n";
+}
+
+void displayAVNStatistics(const vector<Airline>& airlines) 
+{
+    lock_guard<mutex> guard(coutMutex);
+    int totalViolations = 0;
+    double totalFines = 0.0;
+    for (const auto& airline : airlines) totalViolations += airline.violations;
+    for (const auto& avn : avnList) totalFines += avn.fineAmount;
+
+    cout << "\n=====================================\n";
+    cout << "  AIRCONTROLX AVN CONSOLIDATED STATS \n";
+    cout << "=====================================\n";
+    cout << "Total Tracked Violations : " << totalViolations << "\n";
+    cout << "Accumulated Fine Pool   : PKR " << fixed << setprecision(2) << totalFines << "\n";
+}
+
+string getPhaseName(FlightPhase phase) 
+{
+    switch (phase) 
+    {
+        case HOLDING: return "Holding";
+        case APPROACH: return "Approach";
+        case LANDING: return "Landing";
+        case TAXI: return "Taxi";
+        case AT_GATE: return "At Gate";
+        case TAKEOFF_ROLL: return "Takeoff Roll";
+        case CLIMB: return "Climb";
+        case DEPARTURE_CRUISE: return "Departure Cruise";
+        default: return "Operational Cruise";
+    }
+}
+
+string getDirectionName(Direction dir) 
+{
+    switch (dir) 
+    {
+        case NORTH: return "North";
+        case SOUTH: return "South";
+        case EAST: return "East";
+        case WEST: return "West";
+        default: return "Unknown";
+    }
+}
+
+string getAircraftTypeName(AircraftType type) 
+{
+    switch (type) 
+    {
+        case COMMERCIAL: return "Commercial";
+        case CARGO: return "Cargo";
+        case EMERGENCY: return "Emergency";
+        default: return "Unknown";
+    }
+}
+
+void removeAircraftFromEverywhere(Aircraft* aircraft, vector<Aircraft*>& aircrafts, vector<Runway>& runways) 
+{
+    auto it = find(aircrafts.begin(), aircrafts.end(), aircraft);
+    if (it != aircrafts.end()) aircrafts.erase(it);
+
+    for (auto& runway : runways) 
+    {
+        if (runway.currentAircraft == aircraft) 
+        {
+            runway.isOccupied = false;
+            runway.currentAircraft = nullptr;
+        }
+        queue<Aircraft*> tempQueue;
+        while (!runway.waitingQueue.empty()) 
+        {
+            Aircraft* queuedAircraft = runway.waitingQueue.front();
+            runway.waitingQueue.pop();
+            if (queuedAircraft != aircraft) tempQueue.push(queuedAircraft);            
+        }
+        runway.waitingQueue = tempQueue;
+    }
+
+    aircraftStatusMap.erase(aircraft->flightNumber);
+
+    priority_queue<Aircraft*, vector<Aircraft*>, ComparePriority> tempArrivalQueue;
+    while (!arrivalQueue.empty()) 
+    {
+        Aircraft* queuedAircraft = arrivalQueue.top();
+        arrivalQueue.pop();
+        if (queuedAircraft != aircraft) tempArrivalQueue.push(queuedAircraft);        
+    }
+    arrivalQueue = tempArrivalQueue;
+
+    priority_queue<Aircraft*, vector<Aircraft*>, ComparePriority> tempDepartureQueue;
+    while (!departureQueue.empty()) 
+    {
+        Aircraft* queuedAircraft = departureQueue.top();
+        departureQueue.pop();
+        if (queuedAircraft != aircraft) tempDepartureQueue.push(queuedAircraft);        
+    }
+    departureQueue = tempDepartureQueue;
+
+    delete aircraft;
+}
+
+void rebuildQueue(Aircraft* aircraft, priority_queue<Aircraft*, vector<Aircraft*>, ComparePriority>& queue) 
+{
+    vector<Aircraft*> temp;
+    bool found = false;
+
+    while (!queue.empty()) 
+    {
+        Aircraft* a = queue.top();
+        queue.pop();
+        if (a == aircraft) found = true;
+        else temp.push_back(a);        
+    }
+
+    for (auto a : temp) queue.push(a);        
+    if (found) queue.push(aircraft);
+}
+
+bool isAircraftWaiting(const Aircraft& aircraft, const vector<Runway>& runways) 
+{
+    for (const auto& runway : runways) 
+    {
+        queue<Aircraft*> tempQueue = runway.waitingQueue;
+        while (!tempQueue.empty()) 
+        {
+            if (tempQueue.front() == &aircraft) return true;            
+            tempQueue.pop();
+        }
+    }
+    return false;
+}
